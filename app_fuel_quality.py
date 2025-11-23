@@ -9,14 +9,12 @@ import tempfile
 from pathlib import Path
 
 # ---------- Local file paths (your uploads) ----------
-# matches the filenames shown in your repo screenshot
-SCALER_PATH = "/mnt/data/scaler.joblib"
-PLS_PATH    = "/mnt/data/pls_model.joblib"
-# screenshot had rf_model.zip -> we attempt multiple options
-RF_PATH_ZIP = "/mnt/data/rf_model.zip"
-RF_PATH_JOBLIB = "/mnt/data/rf_model.joblib"
-TRAIN_XLSX  = "/mnt/data/diesel_properties_clean.xlsx"
-SPEC_XLSX   = "/mnt/data/diesel_spec.xlsx"
+SCALER_PATH = "scaler.joblib"
+PLS_PATH    = "pls_model.joblib"
+RF_PATH_ZIP = "rf_model.zip"
+RF_PATH_JOBLIB = "rf_model.joblib"
+TRAIN_XLSX  = "diesel_properties_clean.xlsx"
+SPEC_XLSX   = "diesel_spec.xlsx"
 
 # --------------- Helpers ----------------
 def load_joblib_maybe_zipped(path_joblib, path_zip):
@@ -363,3 +361,4 @@ st.markdown("""
 - Add parameter-specific weights (e.g., sulphur could be mandatory with high weight; cetane number may be high importance).
 - Add uncertainty estimates (e.g., use ensemble predictions from RF to show confidence intervals).
 """)
+
