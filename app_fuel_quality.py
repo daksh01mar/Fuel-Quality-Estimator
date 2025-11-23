@@ -4,15 +4,60 @@ import pandas as pd
 import numpy as np
 import joblib
 import os
+import zipfile
+import tempfile
+from pathlib import Path
 
 # ---------- Local file paths (your uploads) ----------
+# matches the filenames shown in your repo screenshot
 SCALER_PATH = "/mnt/data/scaler.joblib"
 PLS_PATH    = "/mnt/data/pls_model.joblib"
-RF_PATH     = "/mnt/data/rf_model.joblib"
+# screenshot had rf_model.zip -> we attempt multiple options
+RF_PATH_ZIP = "/mnt/data/rf_model.zip"
+RF_PATH_JOBLIB = "/mnt/data/rf_model.joblib"
 TRAIN_XLSX  = "/mnt/data/diesel_properties_clean.xlsx"
 SPEC_XLSX   = "/mnt/data/diesel_spec.xlsx"
 
 # --------------- Helpers ----------------
+def load_joblib_maybe_zipped(path_joblib, path_zip):
+    """
+    Try to load a joblib model. If a joblib file exists directly, load it.
+    If a zip exists, try to extract the first .joblib/.pkl inside and load it.
+    Returns loaded object or None.
+    """
+    # direct joblib
+    if os.path.exists(path_joblib):
+        try:
+            return joblib.load(path_joblib)
+        except Exception as e:
+            st.warning(f"Failed to load joblib at {path_joblib}: {e}")
+            return None
+
+    # zipped model
+    if os.path.exists(path_zip):
+        try:
+            with zipfile.ZipFile(path_zip, 'r') as z:
+                # find first plausible model file
+                candidates = [n for n in z.namelist() if n.lower().endswith(('.joblib', '.pkl'))]
+                if not candidates:
+                    st.warning(f"No .joblib/.pkl files found inside {path_zip}")
+                    return None
+                # extract the first candidate into a temp file and load
+                member = candidates[0]
+                tmpdir = tempfile.mkdtemp()
+                extracted = z.extract(member, path=tmpdir)
+                try:
+                    model = joblib.load(extracted)
+                finally:
+                    # don't remove tmpdir immediately; joblib may have open handles on Windows.
+                    pass
+                return model
+        except Exception as e:
+            st.warning(f"Failed to read {path_zip}: {e}")
+            return None
+
+    return None
+
 @st.cache_resource
 def load_artifacts():
     out = {}
@@ -20,19 +65,41 @@ def load_artifacts():
     if not os.path.exists(SCALER_PATH):
         st.error(f"Missing scaler at {SCALER_PATH}")
         return None
-    out['scaler'] = joblib.load(SCALER_PATH)
+    try:
+        out['scaler'] = joblib.load(SCALER_PATH)
+    except Exception as e:
+        st.error(f"Failed to load scaler: {e}")
+        return None
 
-    out['pls'] = joblib.load(PLS_PATH) if os.path.exists(PLS_PATH) else None
-    out['rf']  = joblib.load(RF_PATH)  if os.path.exists(RF_PATH) else None
+    # pls
+    out['pls'] = None
+    if os.path.exists(PLS_PATH):
+        try:
+            out['pls'] = joblib.load(PLS_PATH)
+        except Exception as e:
+            st.warning(f"Failed to load PLS at {PLS_PATH}: {e}")
+
+    # rf: try direct joblib then zip
+    out['rf'] = load_joblib_maybe_zipped(RF_PATH_JOBLIB, RF_PATH_ZIP)
 
     # training df (to get column names / means)
     if not os.path.exists(TRAIN_XLSX):
         st.error(f"Missing training table at {TRAIN_XLSX}")
         return None
-    out['train_df'] = pd.read_excel(TRAIN_XLSX)
+    try:
+        out['train_df'] = pd.read_excel(TRAIN_XLSX)
+    except Exception as e:
+        st.error(f"Failed to read training xlsx: {e}")
+        return None
 
     # specs (min/max)
-    out['spec_df'] = pd.read_excel(SPEC_XLSX) if os.path.exists(SPEC_XLSX) else None
+    if os.path.exists(SPEC_XLSX):
+        try:
+            out['spec_df'] = pd.read_excel(SPEC_XLSX)
+        except Exception:
+            out['spec_df'] = None
+    else:
+        out['spec_df'] = None
 
     return out
 
@@ -59,6 +126,7 @@ def try_align_columns(train_cols, scaler):
 
 def iterative_fill_and_predict(X_init, model, scaler, known_idx, max_iter=12, tol=1e-4):
     X = X_init.copy().astype(float)
+    last_y = None
     for it in range(max_iter):
         try:
             Xs = scaler.transform(X)
@@ -66,12 +134,14 @@ def iterative_fill_and_predict(X_init, model, scaler, known_idx, max_iter=12, to
             Xs = (X - getattr(scaler, "mean_", 0)) / getattr(scaler, "scale_", 1)
         y = model.predict(Xs)
         y = np.array(y).flatten()
+        last_y = y
         if y.shape[0] == X.shape[1]:
-            # assume y in scaled space -> inverse
+            # assume y is in scaled space -> inverse
             try:
                 cand = scaler.inverse_transform(y.reshape(1, -1)).reshape(-1)
             except Exception:
                 cand = y
+            # keep knowns from input
             for idx in known_idx:
                 cand[idx] = X[0, idx]
             diff = np.nanmean(np.abs(cand - X.reshape(-1)))
@@ -79,8 +149,9 @@ def iterative_fill_and_predict(X_init, model, scaler, known_idx, max_iter=12, to
             if diff < tol:
                 return X.reshape(-1), y, True
         else:
+            # model returned prediction shape different than full feature vector
             return X.reshape(-1), y, False
-    return X.reshape(-1), y, False
+    return X.reshape(-1), last_y if last_y is not None else np.array([]), False
 
 # ---------------- Quality scoring ----------------
 def build_spec_map(spec_df):
@@ -89,8 +160,6 @@ def build_spec_map(spec_df):
     if spec_df is None:
         return spec_map
     cols = list(map(str.lower, spec_df.columns))
-    # try to find parameter, min, max, weight, mandatory
-    # common names: 'parameter','min','max','lower','upper','weight','mandatory'
     def find_col(names):
         for n in names:
             if n in cols:
@@ -115,24 +184,17 @@ def build_spec_map(spec_df):
     return spec_map
 
 def score_against_spec(predictions, names, spec_map):
-    """
-    predictions: dict name->value
-    returns: dict name->(score, pass_bool, details)
-    score ranges 0..1 (1 perfect in spec), pass_bool True if in spec or within tolerance
-    """
     out = {}
     for n,v in predictions.items():
         if n in spec_map:
             pmin,pmax,w,mand = spec_map[n]
-            # pass if within [min,max]
             in_spec = (v >= pmin) and (v <= pmax)
             if in_spec:
                 score = 1.0
             else:
-                # compute distance outside normalized by span (so further away -> worse)
                 span = max((pmax - pmin), 1e-6)
                 if v < pmin:
-                    score = max(0.0, 1.0 - (pmin - v) / (span*2))  # degrade smoothly
+                    score = max(0.0, 1.0 - (pmin - v) / (span*2))
                 else:
                     score = max(0.0, 1.0 - (v - pmax) / (span*2))
             out[n] = {"score": float(score), "in_spec": bool(in_spec), "min":pmin, "max":pmax, "weight":float(w), "mandatory":bool(mand)}
@@ -141,7 +203,6 @@ def score_against_spec(predictions, names, spec_map):
     return out
 
 def aggregate_score(spec_scores):
-    # Weighted average of defined scores; missing score -> handled with neutral 0.5 penalty
     total_w = 0.0
     acc = 0.0
     missing = 0
@@ -153,7 +214,6 @@ def aggregate_score(spec_scores):
             mandatory_fail = True
         if s is None:
             missing += 1
-            # treat missing as neutral 0.5 with normal weight
             acc += 0.5 * w
             total_w += w
         else:
